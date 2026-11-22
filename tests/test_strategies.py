@@ -1,7 +1,9 @@
 import unittest
-import pandas as pd
+
 import numpy as np
-from packages.Strategies import MAStrategy, RSIStrategy, MultiFactorStrategy
+import pandas as pd
+
+from packages.Strategies import MAStrategy, MultiFactorStrategy, RSIStrategy
 
 
 class TestStrategies(unittest.TestCase):

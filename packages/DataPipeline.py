@@ -1,201 +1,177 @@
+"""Causal, single-asset OHLCV cleaning and CSV/Parquet storage."""
+
 from __future__ import annotations
 
-"""
-Data ingestion and robust cleaning utilities.
-
-Design principles
------------------
-- Deterministic, "pure" transforms: no I/O in the cleaner, just DataFrame -> DataFrame.
-- Tolerant to vendor glitches: zeros, negative values, inverted high/low, missing bars.
-- Avoid look-ahead bias: time-based interpolation and ffill/bfill are allowed, but we do not
-  invent weekend/holiday bars (we only repair bars that exist).
-- Explicit safeguards: drop invalid dates, cap implausible single-day returns, and re-enforce
-  OHLC structural constraints after interpolation.
-
-Key types
----------
-- DataCleaner: core repair logic for a single-asset OHLCV daily series.
-- DataStore: thin convenience layer for CSV/Parquet I/O (with graceful fallbacks).
-"""
-import os
-import pandas as pd
-import numpy as np
-from dataclasses import dataclass, field
-from typing import Iterable, List, Optional, override
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
-OHLCV = ["open", "high", "low", "close", "volume"]
+import numpy as np
+import pandas as pd
 
-
-def _coerce_numeric(df: pd.DataFrame, cols: Iterable[str]) -> pd.DataFrame:
-    """Coerce selected columns to numeric (invalids -> NaN)."""
-    for c in cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
-
-
-def _repair_ohlc_row(row: pd.Series) -> pd.Series:
-    """
-    Enforce basic OHLC invariants row-wise.
-
-    - If `high < low`, swap them.
-    - Ensure `low <= open, close <= high` by expanding the bounds minimally.
-    """
-    h, l = row.get("high"), row.get("low")
-    if pd.notna(h) and pd.notna(l) and h < l:
-        row["high"], row["low"] = l, h
-    # Tighten/expand bounds so open/close are inside [low, high].
-    for k in ("open", "close"):
-        v = row.get(k)
-        if pd.notna(v):
-            row["high"] = max(row.get("high", v), v)
-            row["low"] = min(row.get("low", v), v)
-    return row
+OHLC = ["open", "high", "low", "close"]
+OHLCV = [*OHLC, "volume"]
 
 
-def _interpolate_time(df: pd.DataFrame, cols: Iterable[str]) -> pd.DataFrame:
-    """
-    Interpolate over time index; ffill/bfill as last resort.
-    Assumes a DatetimeIndex with monotonically increasing timestamps.
-    """
-    df[cols] = df[cols].interpolate(method="time", limit_direction="both")
-    df[cols] = df[cols].ffill().bfill()
-    return df
+def _repair_ohlc(df: pd.DataFrame) -> None:
+    """Expand bounds to contain every observed price, without row-wise apply."""
+    bounds = df[OHLC]
+    df["high"] = bounds.max(axis=1)
+    df["low"] = bounds.min(axis=1)
 
 
 @dataclass
 class DataCleaner:
-    """
-    Cleans a single-asset OHLCV DataFrame.
+    """Repair existing bars using only information available at each timestamp.
 
-    Parameters
-    ----------
-    fix_volume_outliers : bool
-        Whether to apply robust de-spiking on volume.
-    vol_clip_z : float
-        Z-score threshold (via rolling-median MAD) for flagging volume outliers.
-    price_ret_clip : float
-        Absolute daily return threshold above which a bar is treated as a data error
-        and repaired through interpolation.
+    Missing prices are forward-filled; unrepairable leading bars are dropped.
+    Jumps exceeding ``price_ret_clip`` relative to the last accepted close are
+    treated as data errors. This heuristic can remove real market moves; use
+    ``float("inf")`` to disable it for already validated/adjusted data.
+    Volume de-spiking uses trailing medians and median absolute residuals.
+    No weekend/holiday bars are created.
     """
+
     fix_volume_outliers: bool = True
     vol_clip_z: float = 5.0
     price_ret_clip: float = 0.2
 
     def clean(self, df: pd.DataFrame, date_col: str = "date") -> pd.DataFrame:
-        """
-        Clean a raw OHLCV DataFrame.
+        """Normalize, validate and causally repair raw OHLC(V) observations."""
+        if np.isnan(self.price_ret_clip) or self.price_ret_clip <= 0:
+            raise ValueError("price_ret_clip must be positive")
+        if not np.isfinite(self.vol_clip_z) or self.vol_clip_z <= 0:
+            raise ValueError("vol_clip_z must be finite and positive")
 
-        Steps
-        -----
-        1) Parse dates, drop invalid/duplicates, sort.
-        2) Coerce OHLCV numerics; set negatives -> NaN and treat zeros in prices as missing.
-        3) Row-wise structural repair (swap high/low if reversed; enforce bounds).
-        4) Time-aware interpolation for all numeric series; ffill/bfill last resort.
-        5) Daily-return outlier handling: |ret| > `price_ret_clip` -> set OHLC to NaN and re-interpolate.
-        6) Volume robust de-spiking using rolling-median and MAD-derived z-score.
-        7) Final rounding/typing for volume.
-        """
         df = df.copy()
-        if date_col not in df.columns:
-            raise ValueError("missing date column")
-        # Parse/validate time; keep good rows only.
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-        df = df.dropna(subset=[date_col])
-        # Normalize column names to lowercase to prevent subtle mismatches.
-        df.columns = [c.lower() for c in df.columns]
+        df.columns = [str(c).strip().lower() for c in df.columns]
+        date_col = date_col.strip().lower()
+        if not df.columns.is_unique:
+            raise ValueError("duplicate column names after normalization")
+        missing = [c for c in [date_col, *OHLC] if c not in df.columns]
+        if missing:
+            raise ValueError(f"missing required columns: {', '.join(missing)}")
 
-        # Keep only columns we recognize; extra columns are ignored.
-        need = [date_col] + OHLCV
-        df = df[[c for c in need if c in df.columns]]
-        df = _coerce_numeric(df, [c for c in OHLCV if c in df.columns])
-        df = df.drop_duplicates(subset=[date_col]).sort_values(date_col).set_index(date_col)
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce", format="mixed")
+        columns = [c for c in OHLCV if c in df.columns]
+        df = (
+            df.dropna(subset=[date_col])
+            .drop_duplicates(subset=[date_col], keep="first")
+            .sort_values(date_col)
+            .set_index(date_col)[columns]
+        )
+        df = df.apply(pd.to_numeric, errors="coerce").astype(float)
+        df = df.replace([np.inf, -np.inf], np.nan)
+        df = df.mask(df < 0)
+        df[OHLC] = df[OHLC].mask(df[OHLC] == 0).ffill()
 
-        # Basic sanity rules: negative values are invalid; zero prices treated as missing.
-        for c in ("open", "high", "low", "close", "volume"):
-            if c in df.columns:
-                df.loc[df[c] < 0, c] = np.nan
-        for c in ("open", "high", "low", "close"):
-            if c in df.columns:
-                df.loc[df[c] == 0, c] = np.nan
+        # Compare against the last accepted close, not a rejected spike. This
+        # preserves a valid recovery bar immediately following corrupt data.
+        bad = np.zeros(len(df), dtype=bool)
+        previous = None
+        for i, close in enumerate(df["close"].to_numpy()):
+            if np.isnan(close):
+                continue
+            if previous is not None and abs(close / previous - 1) > self.price_ret_clip:
+                bad[i] = True
+            else:
+                previous = close
+        df.loc[bad, OHLC] = np.nan
+        df[OHLC] = df[OHLC].ffill()
+        _repair_ohlc(df)
+        df = df.dropna(subset=OHLC)
 
-        # Row-wise structural repair prior to interpolation.
-        df = df.apply(_repair_ohlc_row, axis=1)
-
-        # Time-aware interpolation across all numeric columns.
-        numeric_cols = [c for c in OHLCV if c in df.columns]
-        df = _interpolate_time(df, numeric_cols)
-
-        # Remove implausible price jumps by marking as NaN and interpolating again.
-        if "close" in df.columns:
-            ret = df["close"].pct_change().abs()
-            bad = ret > self.price_ret_clip
-            if bad.any():
-                for c in ("open", "high", "low", "close"):
-                    if c in df.columns:
-                        df.loc[bad, c] = np.nan
-                df = _interpolate_time(df, numeric_cols)
-                df = df.apply(_repair_ohlc_row, axis=1)
-
-        # Robust volume de-spiking (optional).
-        if "volume" in df.columns and self.fix_volume_outliers and len(df) > 50:
-            vol = df["volume"].astype(float)
-            ma = vol.rolling(50, min_periods=20).median()
-            mad = (vol - ma).abs().rolling(50, min_periods=20).median()
-            # Convert MAD to a robust z-score (MAD * 1.4826 ~ std for Gaussian)
-            z = (vol - ma) / (mad.replace(0, np.nan) * 1.4826)
-            df.loc[z.abs() > self.vol_clip_z, "volume"] = ma
-            df["volume"] = df["volume"].interpolate(method="time").ffill().bfill()
-            df["volume"] = df["volume"].round()
-
+        if "volume" in df.columns:
+            # Missing initial volume represents no known activity, not a future fill.
+            volume = df["volume"].ffill().fillna(0)
+            if self.fix_volume_outliers:
+                median = volume.rolling(50, min_periods=20).median()
+                mad = (volume - median).abs().rolling(50, min_periods=20).median()
+                z = (volume - median) / (mad.replace(0, np.nan) * 1.4826)
+                spike = (z.abs() > self.vol_clip_z) | (
+                    mad.eq(0) & volume.ne(median)
+                )
+                volume = volume.mask(spike, median)
+            df["volume"] = volume.round()
         return df
 
 
 @dataclass
 class DataStore:
-    """
-    Light convenience I/O wrapper that uses DataCleaner internally.
-    """
+    """Read Parquet directly, or clean CSVs with configuration-aware caches."""
+
     data_cleaner: DataCleaner = field(default_factory=DataCleaner)
     override_cache: bool = True
 
-    def read(self, path: str) -> pd.DataFrame:
-        """
-        Read a cleaned DataFrame from Parquet.
-        If a file is missing or override_cache == True, write to a new parquet file.
-        """
-        parquet_path = os.path.splitext(path)[0] + ".parquet"
-        if self.override_cache or not os.path.isfile(parquet_path):
-            clean_data = self.data_cleaner.clean(pd.read_csv(path), "date")
-            clean_data.to_parquet(parquet_path)
-            return clean_data
-        else:
-            return pd.read_parquet(parquet_path)
+    def _clean_csv(self, csv_path: Path, parquet_path: Path) -> pd.DataFrame:
+        # Persist the policy with the cached frame. Legacy caches and caches
+        # created with different settings must not bypass causal cleaning.
+        source = csv_path.stat()
+        policy = {
+            "version": 1,
+            "cleaner": asdict(self.data_cleaner),
+            "source": str(csv_path.resolve()),
+            "mtime_ns": source.st_mtime_ns,
+            "size": source.st_size,
+        }
+        if (
+            not self.override_cache
+            and parquet_path.is_file()
+            and parquet_path.stat().st_mtime_ns >= source.st_mtime_ns
+        ):
+            cached = pd.read_parquet(parquet_path)
+            if cached.attrs.get("cleaning_policy") == policy:
+                return cached
 
+        cleaned = self.data_cleaner.clean(pd.read_csv(csv_path))
+        cleaned.attrs["cleaning_policy"] = policy
+        parquet_path.parent.mkdir(parents=True, exist_ok=True)
+        cleaned.to_parquet(parquet_path, index=True)
+        return cleaned
+
+    def read(self, path: str | Path) -> pd.DataFrame:
+        """Read a Parquet file, or a CSV using a sibling Parquet cache."""
+        path = Path(path)
+        if path.suffix.lower() == ".parquet":
+            return pd.read_parquet(path)
+        if path.suffix.lower() != ".csv":
+            raise ValueError("data path must end in .csv or .parquet")
+        return self._clean_csv(path, path.with_suffix(".parquet"))
 
     def csv_to_parquet(self, csv_path: str, parquet_path: str) -> str:
-        """Convert a CSV at `csv_path` to a cleaned Parquet."""
-        if self.override_cache or not os.path.isfile(parquet_path):
-            raw = pd.read_csv(csv_path)
-            df = self.data_cleaner.clean(raw, "date")
-            df.to_parquet(parquet_path, index=True)
-
+        """Convert a CSV to cleaned Parquet, creating parent directories."""
+        if Path(csv_path).suffix.lower() != ".csv" or Path(parquet_path).suffix.lower() != ".parquet":
+            raise ValueError("conversion requires a .csv source and a .parquet target")
+        if Path(csv_path).resolve() == Path(parquet_path).resolve():
+            raise ValueError("CSV source and Parquet target must be different")
+        self._clean_csv(Path(csv_path), Path(parquet_path))
         return parquet_path
 
     def bulk_csv_to_parquet(
-            self,
-            csv_paths: List[str],
-            parquet_paths: Optional[List[str]] = None,
-            max_workers: int = 8
-    ) -> List[str]:
-        """Convert many CSVs in parallel. Returns list of created target paths."""
-        if not parquet_paths:
-            parquet_paths = [os.path.splitext(csv_path)[0] + ".parquet" for csv_path in csv_paths]
-
-        out_paths: List[str] = []
-        with ProcessPoolExecutor(max_workers=max_workers) as ex:
-            futures = [ex.submit(self.csv_to_parquet, csv_paths[i], parquet_paths[i]) for i in range(len(csv_paths))]
-            for f in futures:
-                out_paths.append(f.result())
-
-        return out_paths
+        self,
+        csv_paths: list[str],
+        parquet_paths: list[str] | None = None,
+        max_workers: int = 8,
+    ) -> list[str]:
+        """Convert files in input order; reject mismatched or colliding targets."""
+        if parquet_paths is None:
+            parquet_paths = [str(Path(path).with_suffix(".parquet")) for path in csv_paths]
+        if len(csv_paths) != len(parquet_paths):
+            raise ValueError("CSV and Parquet path lists must have the same length")
+        if len({Path(path).resolve() for path in parquet_paths}) != len(parquet_paths):
+            raise ValueError("Parquet targets must be unique")
+        if any(Path(path).suffix.lower() != ".csv" for path in csv_paths) or any(
+            Path(path).suffix.lower() != ".parquet" for path in parquet_paths
+        ):
+            raise ValueError("conversion requires .csv sources and .parquet targets")
+        if max_workers <= 0:
+            raise ValueError("max_workers must be positive")
+        if not csv_paths:
+            return []
+        if max_workers == 1:
+            return [
+                self.csv_to_parquet(source, target)
+                for source, target in zip(csv_paths, parquet_paths)
+            ]
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            return list(executor.map(self.csv_to_parquet, csv_paths, parquet_paths))

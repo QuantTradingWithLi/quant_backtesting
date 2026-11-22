@@ -1,14 +1,16 @@
-from __future__ import annotations
-
 """
 Feature engineering for ML strategies.
 
 All transforms are look-ahead safe: features at time t are computed only from
 data at or before t.
 """
-import pandas as pd
-import numpy as np
+from __future__ import annotations
+
 from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+
 from packages.Signals import rsi
 
 
@@ -31,24 +33,22 @@ class FeatureEngineer:
         """
         Parameters
         ----------
-        prices : DataFrame with at least columns ['open','close']
+        prices : DataFrame with at least a 'close' column
 
         Returns
         -------
         (X, y) : (DataFrame, Series)
             X: features aligned to prices.index
-            y: next-day close-to-close return (aligned to same index)
+            y: next-day close-to-close return (NaN for the latest unknown label)
         """
         close = prices['close'].astype(float)
-        openp = prices['open'].astype(float)
-
         # Basic returns
-        ret1 = close.pct_change()
+        ret1 = close.pct_change(fill_method=None)
         feats = {}
 
         # Lagged returns
         for L in self.ret_lags:
-            feats[f"ret_{L}"] = close.pct_change(L)
+            feats[f"ret_{L}"] = close.pct_change(L, fill_method=None)
 
         # Moving averages and spreads
         for w in self.ma_windows:
@@ -67,7 +67,9 @@ class FeatureEngineer:
         if self.include_volume and 'volume' in prices.columns:
             v = prices['volume'].astype(float)
             v_ma = v.rolling(20).mean()
-            feats["vol_z"] = (v - v_ma) / (v_ma.rolling(20).std())
+            scale = v_ma.rolling(20).std()
+            volume_score = self._safe_div(v - v_ma, scale)
+            feats["vol_z"] = volume_score.mask(scale.eq(0) & v.eq(v_ma), 0.0)
 
         X = pd.DataFrame(feats, index=prices.index)
 
@@ -77,10 +79,11 @@ class FeatureEngineer:
             X[rsi_col] = (X[rsi_col] - 50.0) / 50.0
 
         # Target: next-day close-to-close return
-        y = close.pct_change().shift(-1)
+        y = ret1.shift(-1).replace([np.inf, -np.inf], np.nan)
 
-        # Drop rows with any NaNs (strict to ensure deterministic training)
-        valid = X.notna().all(axis=1) & y.notna()
+        # Inference must not depend on whether tomorrow's label exists.
+        X = X.replace([np.inf, -np.inf], np.nan)
+        valid = X.notna().all(axis=1)
         X = X.loc[valid]
         y = y.loc[valid]
 

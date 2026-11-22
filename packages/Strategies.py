@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Strategy interface and reference implementations.
 
@@ -7,14 +5,26 @@ A Strategy receives historical prices and emits *target positions* in {-1, 0, 1}
 The interface is intentionally minimal so the same class can be used in
 backtests (offline) and a trading engine (online).
 """
-import pandas as pd
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+
 from packages.Constants import MachineLearningModel
-from packages.Signals import MASignal, RSISignal
-from packages.ML.Walkforward import WalkForward
 from packages.ML.Features import FeatureEngineer
-from packages.ML.Models import RidgeLinear, LogisticRegressionGD, KNNRegressor, DecisionStumpRegressor, EnsembleAverage
+from packages.ML.Models import (
+    DecisionStumpRegressor,
+    EnsembleAverage,
+    KNNRegressor,
+    LogisticRegressionGD,
+    RidgeLinear,
+)
+from packages.ML.Walkforward import WalkForward
+from packages.Signals import MASignal, RSISignal
+
 
 class Strategy(ABC):
     """Abstract base for any strategy that turns prices into target positions."""
@@ -81,7 +91,7 @@ class MultiFactorStrategy(Strategy):
         ma = MASignal(self.fast, self.slow)(prices["close"]).astype(float)
         rsi = RSISignal(self.rsi_window, self.rsi_low, self.rsi_high)(prices["close"]).astype(float)
         s = self.w_trend * ma + self.w_meanrev * rsi
-        s = s.where(s.abs() >= 0.25, 0).apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+        s = np.sign(s.where(s.abs() >= 0.25, 0))
         return s.astype(int).rename(self.name)
 
 
@@ -89,7 +99,7 @@ class MultiFactorStrategy(Strategy):
 class MLStrategy(Strategy):
     """
     ML-driven strategy using walk-forward training on engineered features.
-    Supports multiple model backends via `model_type`.
+    Supports multiple model backends via `model`.
     """
     model: MachineLearningModel
     include_volume: bool = True
@@ -124,10 +134,9 @@ class MLStrategy(Strategy):
             train_window=self.train_window,
             retrain_every=self.retrain_every,
             min_train=self.min_train,
-            alpha=self.alpha
         )
         cols = [c for c in ["open", "close", "volume"] if c in prices.columns]
         preds = wf.predict(prices[cols])
-        pos = preds.apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+        pos = np.sign(preds.fillna(0))
         pos.name = self.name
         return pos.astype(int)
