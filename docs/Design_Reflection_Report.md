@@ -57,7 +57,7 @@
 - Completed-close signals cannot guarantee actual market-on-close auction fills; use next-open execution for the default causal timing.
 - Price jump filtering can discard genuine jumps/splits; validate and adjust vendor data before research.
 - Parquet reads load a complete frame; lazy asset/date queries and GPU processing are not implemented.
-- See [Code_Review.md](Code_Review.md) for the correctness review and regression coverage.
+- See [README.md](../README.md) for current capabilities, limitations, and validation commands.
 
 ## Stage 2 – ML/AI Integration Plan
 
