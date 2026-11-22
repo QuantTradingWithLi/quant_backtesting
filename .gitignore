@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local test and lint artifacts
+.pytest_cache/
+.ruff_cache/

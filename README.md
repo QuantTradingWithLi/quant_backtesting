@@ -84,13 +84,51 @@ Participants are encouraged to submit:
 ---
 
 ## Running The Code
-- **Installing Dependencies: `uv sync`** 
-- **Processing Data: `./scripts/process_data.py --csv_dir "../spydata" --out_dir "../processed_data" --override_cache True`**  
-- **Running Backtest: `./scripts/run_backtest.py --market_data "../spydata/data.csv" --strategy_type "MACHINE_LEARNING" --strategy_model "K_NEAREST_NEIGHBORS_REGRESSOR"`**  
-- **Running Unit Tests: `./tests/run_tests.py`**
+Run these commands from the repository root with Python 3.12+ and `uv`:
+
+```powershell
+uv sync
+uv run python -m scripts.process_data --csv_dir spydata --out_dir processed_data --override_cache --max_workers 8
+uv run python -m scripts.run_backtest --market_data processed_data/data.parquet --outdir out
+uv run python -m scripts.run_backtest --market_data processed_data/data.parquet --strategy_type MACHINE_LEARNING --strategy_model K_NEAREST_NEIGHBORS_REGRESSOR --outdir out
+uv run pytest -q
+uvx ruff check packages scripts tests
+```
+
+Direct script execution (`uv run python scripts/run_backtest.py ...`) and
+`uv run python tests/run_tests.py` are also supported. `uv sync` includes the
+development test dependency; use `uv sync --no-dev` for runtime dependencies only.
+The implemented models use NumPy/Pandas, not PyTorch or GPU acceleration.
+
+### Data and execution conventions
+- CSV input requires `date`, `open`, `high`, `low`, and `close`; `volume` is optional.
+  Column names are case-insensitive and whitespace is stripped.
+- Cleaning is causal: missing prices use past observations only, leading
+  unrepairable bars are dropped, and no calendar bars are invented. The default
+  20% close-return filter is a data-quality heuristic, **not** a corporate-action
+  adjustment; it can discard genuine moves. Configure `DataCleaner` appropriately
+  for your data (use `price_ret_clip=float("inf")` to disable the filter).
+- CSV caches record source metadata and cleaner settings. Legacy/incompatible
+  caches are rebuilt automatically. Direct Parquet input is trusted as already
+  processed; regenerate existing `processed_data/` files with the command above.
+- Strategies receive all market-data columns and produce close-time target
+  positions in `{-1, 0, 1}`. Prices must have a sorted, unique index.
+- Default `NEXT_OPEN` execution applies yesterday's target at today's open:
+  old exposure earns the overnight return and new exposure earns the intraday return.
+  `--trade_on MARKET_ON_CLOSE` is idealized close execution and only earns returns
+  after the signal's close; actual auction cutoffs are not modeled.
+- This is a target-exposure return model, not a share/cash ledger. Costs apply to
+  target turnover; shorts, financing, margin and corporate actions need further
+  modeling. Final positions are marked to market, not forcibly liquidated.
+- ML features retain the latest row even without a known next-day label.
+  Walk-forward training uses earlier rows with observed labels only.
+- Results include `ret`, `pos`, `trades`, `gross`, `net`, and `equity`. `ret` is the
+  underlying close-to-close return, `pos` is end-of-day exposure, and `trades` is
+  absolute target turnover. Summary JSON uses `null` for undefined statistics.
+
+See [the code review](docs/Code_Review.md) for findings, fixes and remaining limitations.
 
 ---
 
 ## Closing Note
 This challenge is intended purely as a demonstration of technical and architectural capabilities in quantitative systems development. It represents an independent and educational exploration of backtesting framework design principles.
-

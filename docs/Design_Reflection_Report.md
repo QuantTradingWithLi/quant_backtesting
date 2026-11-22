@@ -10,7 +10,7 @@
 
 ## Architecture
 **Packages**
-- `BackTestingEngine`: orchestration (`Backtester`, `Simulator`, `Metrics`).
+- `BackTestingEngine`: orchestration (`BackTestingEngine`, `Simulator`, `Metrics`).
 - `TradingEngine`: minimal live-trading engine skeleton (`MarketDataProvider`, `OrderExecutor`, `TradingEngine`).
 - `DataPipeline`: cleaning + ingestion to Parquet (`DataCleaner`, `DataStore`).
 - `Signals`: indicators & signals (`MASignal`, `RSISignal`).
@@ -24,7 +24,8 @@
   - Parse/validate dates; drop invalid and duplicates.
   - Coerce numerics; negative prices/volumes → NaN.
   - Repair inverted `high`/`low`; enforce `low <= open,close <= high`.
-  - Time‑aware interpolation then ffill/bfill for missing points.
+  - Causal forward-fill for missing points; drop unrepairable leading bars.
+  - Reject close-return outliers relative to the last accepted close (configurable heuristic).
   - Robust volume de‑spiking via rolling‑median MAD z‑score clipping (configurable).
 - Parallel conversion via `ProcessPoolExecutor` supports 10k+ files.
 
@@ -35,10 +36,14 @@
 
 **Execution Model**
 - Positions are the prior day’s end‑of‑day signal; trades execute at next day’s open (`NEXT_OPEN`), with per‑side bps commission + slippage.
+- Old exposure earns the close-to-open gap; the new target earns the open-to-close return. These return legs compound.
+- `MOC` is idealized close execution; the prior position earns the close-to-close return and the new target is set afterward.
+- Positions are target exposures, not a share/cash ledger. Costs are proportional to absolute target changes, including the initial entry; no forced terminal liquidation.
 - Results include daily net/gross returns, trades, position, equity curve.
 
 **Metrics**
-- Annualized return/volatility, Sharpe (rf=0), max drawdown, Calmar, win rate, total return.
+- Annualized compounded return/volatility, arithmetic excess-return Sharpe (default annual rf=2.66%), max drawdown, Calmar, win rate, total return.
+- Drawdown includes initial equity of 1.0. Undefined statistics remain NaN internally and are serialized as JSON null.
 
 **Performance & Scaling**
 - Columnar Parquet enables lazy I/O and fast slicing across assets.
@@ -49,6 +54,10 @@
 - Cost model is simplified; extend with fixed fees, spread model, partial fills.
 - Corporate actions/adjustments not modeled here; integrate with vendor adj factors.
 - No portfolio optimizer; single‑asset example. Generalize to basket + risk targeting.
+- Completed-close signals cannot guarantee actual market-on-close auction fills; use next-open execution for the default causal timing.
+- Price jump filtering can discard genuine jumps/splits; validate and adjust vendor data before research.
+- Parquet reads load a complete frame; lazy asset/date queries and GPU processing are not implemented.
+- See [Code_Review.md](Code_Review.md) for the correctness review and regression coverage.
 
 ## Stage 2 – ML/AI Integration Plan
 
@@ -86,6 +95,7 @@ class MLStrategy(Strategy):
 
 ### Training & Validation
 - Walk-forward CV (already supported).
+- Keep feature-valid rows for inference even when their future label is unknown; only earlier observed labels enter a fit.
 - Rolling train/test windows.
 - Hyperparameter tuning with Optuna/sklearn.
 - Evaluate by Sharpe, Sortino, drawdown, turnover.

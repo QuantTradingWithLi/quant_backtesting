@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Tiny ML models implemented without external dependencies.
 
@@ -7,12 +5,37 @@ All models share a minimal API:
     fit(X: DataFrame, y: Series) -> self
     predict(X: DataFrame) -> np.ndarray
 """
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
-from typing import List
-from dataclasses import dataclass
-from abc import ABC, abstractmethod
+
+
+def _training_arrays(X: pd.DataFrame, y: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+    """Shared model contract: nonempty, finite, uniquely named, aligned data."""
+    if X.empty or not X.columns.is_unique:
+        raise ValueError("training features must be nonempty with unique columns")
+    if not X.index.is_unique or not X.index.equals(y.index):
+        raise ValueError("training features and targets must have matching unique indices")
+    Xn = X.to_numpy(dtype=float)
+    yn = y.to_numpy(dtype=float)
+    if yn.ndim != 1 or not np.isfinite(Xn).all() or not np.isfinite(yn).all():
+        raise ValueError("training features and targets must be finite")
+    return Xn, yn
+
+
+def _prediction_array(X: pd.DataFrame, columns: list[str] | None) -> np.ndarray:
+    if columns is None:
+        raise ValueError("Model is not fitted.")
+    if not X.columns.is_unique or not set(columns).issubset(X.columns):
+        raise ValueError("prediction data is missing required or unique feature columns")
+    values = X[columns].to_numpy(dtype=float)
+    if not np.isfinite(values).all():
+        raise ValueError("prediction features must be finite")
+    return values
 
 
 class MLModel(ABC):
@@ -71,23 +94,26 @@ class RidgeLinear(MLModel):
         -----
         - If `fit_intercept=True`, an intercept column of ones is appended and
           the intercept term is **not** penalized by ridge (`alpha`).
-        - Uses `(X^T X + alpha I)^{-1} X^T y` with care to avoid penalizing
-          the intercept dimension.
+        - Solves an augmented least-squares system, avoiding the conditioning
+          loss of normal equations and supporting singular designs at alpha=0.
         """
+        Xn, yn = _training_arrays(X, y)
+        if not np.isfinite(self.alpha) or self.alpha < 0:
+            raise ValueError("alpha must be finite and nonnegative")
         self.cols_ = list(X.columns)
-        Xn = X.values.astype(float)
-        yn = y.values.astype(float).reshape(-1, 1)
         if self.fit_intercept:
             X_aug = np.hstack([Xn, np.ones((Xn.shape[0], 1))])
         else:
             X_aug = Xn
 
-        I = np.eye(X_aug.shape[1])
+        penalty = np.sqrt(self.alpha) * np.eye(X_aug.shape[1])
         if self.fit_intercept:
-            I[-1, -1] = 0.0  # don't penalize intercept
-        XtX = X_aug.T @ X_aug
-        XtY = X_aug.T @ yn
-        w_all = np.linalg.solve(XtX + self.alpha * I, XtY).ravel()
+            penalty[-1, -1] = 0.0  # don't penalize intercept
+        w_all = np.linalg.lstsq(
+            np.vstack([X_aug, penalty]),
+            np.concatenate([yn, np.zeros(X_aug.shape[1])]),
+            rcond=None,
+        )[0]
 
         if self.fit_intercept:
             self.w_ = w_all[:-1]
@@ -106,15 +132,16 @@ class RidgeLinear(MLModel):
         X : pd.DataFrame
             Feature matrix with the **same columns** (order-insensitive by name)
             used during training (`fit`). Extra columns are ignored; missing
-            columns will raise an assertion error.
+            columns will raise a ValueError.
 
         Returns
         -------
         np.ndarray
             Array of shape (n_samples,) with continuous predictions.
         """
-        assert self.w_ is not None and self.cols_ is not None, "Model is not fitted."
-        Xn = X[self.cols_].values.astype(float)
+        if self.w_ is None:
+            raise ValueError("Model is not fitted.")
+        Xn = _prediction_array(X, self.cols_)
         return Xn @ self.w_ + self.b_
 
 
@@ -159,12 +186,16 @@ class LogisticRegressionGD(MLModel):
         - Gradients are averaged over the batch; we run `epochs` full passes.
         - This minimalist solver is for research/educational use and small datasets.
         """
+        Xn, targets = _training_arrays(X, y)
+        if not np.isfinite(self.alpha) or self.alpha < 0:
+            raise ValueError("alpha must be finite and nonnegative")
+        if not np.isfinite(self.lr) or self.lr <= 0 or self.epochs <= 0:
+            raise ValueError("learning rate and epochs must be positive")
         self.cols_ = list(X.columns)
-        Xn = X.values.astype(float)
-        yn = (y.values > 0).astype(float)  # label: 1 if positive target, else 0
+        yn = (targets > 0).astype(float)  # label: 1 if positive target, else 0
         n, d = Xn.shape
         self.w_ = np.zeros(d)
-        self.b_ = 0.0 if self.fit_intercept else 0.0
+        self.b_ = 0.0
 
         for _ in range(self.epochs):
             z = Xn @ self.w_ + (self.b_ if self.fit_intercept else 0.0)
@@ -192,8 +223,9 @@ class LogisticRegressionGD(MLModel):
             Array of shape (n_samples,) with centered probabilities `p - 0.5`,
             where `p = P(y=1|x)`. Values in (-0.5, 0.5).
         """
-        assert self.w_ is not None and self.cols_ is not None, "Model is not fitted."
-        Xn = X[self.cols_].values.astype(float)
+        if self.w_ is None:
+            raise ValueError("Model is not fitted.")
+        Xn = _prediction_array(X, self.cols_)
         z = Xn @ self.w_ + (self.b_ if self.fit_intercept else 0.0)
         p = self._sigmoid(z)
         return p - 0.5  # centered probability
@@ -232,9 +264,12 @@ class KNNRegressor(MLModel):
         - No actual optimization happens; we just store `X` and `y`.
         - Distance metric is Euclidean; neighbors use uniform weighting.
         """
+        Xn, yn = _training_arrays(X, y)
+        if not isinstance(self.k, int) or self.k <= 0:
+            raise ValueError("k must be a positive integer")
         self.cols_ = list(X.columns)
-        self.X_ = X[self.cols_].values.astype(float)
-        self.y_ = y.values.astype(float)
+        self.X_ = Xn
+        self.y_ = yn
         return self
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
@@ -255,11 +290,13 @@ class KNNRegressor(MLModel):
         -----
         - Complexity is O(n_query * n_train * n_features); suitable for small sets.
         """
-        assert self.X_ is not None and self.y_ is not None and self.cols_ is not None, "Model is not fitted."
-        Xq = X[self.cols_].values.astype(float)
+        if self.X_ is None or self.y_ is None:
+            raise ValueError("Model is not fitted.")
+        Xq = _prediction_array(X, self.cols_)
         # Compute pairwise distances (naive)
-        dists = np.sqrt(((Xq[:, None, :] - self.X_[None, :, :]) ** 2).sum(axis=2))
-        idx = np.argpartition(dists, kth=min(self.k, self.X_.shape[0] - 1), axis=1)[:, :self.k]
+        dists = ((Xq[:, None, :] - self.X_[None, :, :]) ** 2).sum(axis=2)
+        k = min(self.k, self.X_.shape[0])
+        idx = np.argpartition(dists, kth=k - 1, axis=1)[:, :k]
         preds = self.y_[idx].mean(axis=1)
         return preds
 
@@ -297,9 +334,13 @@ class DecisionStumpRegressor(MLModel):
         - For each feature `j`, we split at its sample median and compute the
           mean target on each side; we pick the split with the lowest MSE.
         """
+        Xn, yn = _training_arrays(X, y)
         self.cols_ = list(X.columns)
-        Xn = X.values.astype(float)
-        yn = y.values.astype(float)
+        # A constant model is the valid fallback when no split exists. Reset
+        # every fit so a previous tree cannot leak into a constant-data refit.
+        self.feature_ = 0
+        self.threshold_ = np.inf
+        self.left_value_ = self.right_value_ = float(yn.mean())
         best_mse = np.inf
 
         for j in range(Xn.shape[1]):
@@ -333,8 +374,9 @@ class DecisionStumpRegressor(MLModel):
         np.ndarray
             Array of shape (n_samples,) with piecewise-constant predictions.
         """
-        assert self.feature_ is not None and self.cols_ is not None, "Model is not fitted."
-        Xn = X[self.cols_].values.astype(float)
+        if self.feature_ is None:
+            raise ValueError("Model is not fitted.")
+        Xn = _prediction_array(X, self.cols_)
         left = Xn[:, self.feature_] <= self.threshold_
         out = np.where(left, self.left_value_, self.right_value_)
         return out
@@ -345,7 +387,8 @@ class EnsembleAverage(MLModel):
     """
     Simple averaging ensemble over a list of base models.
     """
-    base_models: List[object]
+    base_models: list[MLModel]
+    fitted_models_: list[MLModel] = field(default_factory=list, init=False, repr=False)
 
     def fit(self, X: pd.DataFrame, y: pd.Series) -> MLModel:
         """
@@ -368,9 +411,12 @@ class EnsembleAverage(MLModel):
         - Each base model must expose `fit(X, y)` and `predict(X)`.
         - The ensemble stores the fitted models internally.
         """
+        _training_arrays(X, y)
+        if not self.base_models:
+            raise ValueError("ensemble must contain at least one model")
         self.fitted_models_ = []
-        for m in self.base_models:
-            self.fitted_models_.append(m.fit(X, y))
+        fitted = [model.fit(X, y) for model in self.base_models]
+        self.fitted_models_ = fitted
         return self
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
@@ -387,5 +433,7 @@ class EnsembleAverage(MLModel):
         np.ndarray
             Array of shape (n_samples,) with averaged predictions.
         """
+        if not self.fitted_models_:
+            raise ValueError("Model is not fitted.")
         preds = [m.predict(X) for m in self.fitted_models_]
         return np.mean(preds, axis=0)

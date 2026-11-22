@@ -3,16 +3,27 @@ Command-line backtest runner with integrated data processing pipeline.
 
 Examples
 --------
-python run_backtest.py --market_data "../spydata/data.csv" --strategy_type "STATISTICS" --strategy_model "MULTI_FACTOR" --commission_bps 1 --slippage_bps 1
+uv run python -m scripts.run_backtest --market_data spydata/data.csv
 """
-import argparse, os, json
-import pandas as pd
+import argparse
+import json
+import math
+import os
+import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
 import matplotlib.pyplot as plt
-from datetime import datetime, timedelta, timezone
-from packages.Constants import StrategyType, StatisticsModel, ExecutionType
-from packages.DataPipeline import DataStore
+import pandas as pd
+
+# Support direct script execution as well as `python -m scripts.run_backtest`.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from packages.BackTestingEngine import BackTestingEngine
-from packages.Strategies import MAStrategy, RSIStrategy, MultiFactorStrategy, MLStrategy
+from packages.Constants import ExecutionType, MachineLearningModel, StatisticsModel, StrategyType
+from packages.DataPipeline import DataStore
+from packages.Strategies import MAStrategy, MLStrategy, MultiFactorStrategy, RSIStrategy
 
 
 def plot_equity(result_df: pd.DataFrame, out_path: str) -> str:
@@ -35,7 +46,7 @@ def plot_drawdown(result_df: pd.DataFrame, out_path: str) -> str:
     Plot the drawdown series derived from the equity curve.
     """
     eq = result_df["equity"]
-    dd = eq / eq.cummax() - 1
+    dd = eq / eq.cummax().clip(lower=1.0) - 1
     plt.figure(figsize=(10, 4))
     dd.plot()
     plt.title("Drawdown")
@@ -50,42 +61,52 @@ def plot_drawdown(result_df: pd.DataFrame, out_path: str) -> str:
 def now_str(
         delta: timedelta = timedelta(0),
 ) -> str:
-    return (datetime.now().astimezone(timezone.utc) + delta).strftime("%Y%m%d_%H%M%S")
+    return (datetime.now(UTC) + delta).strftime("%Y%m%d_%H%M%S")
 
 
-def main():
+def main(argv: list[str] | None = None):
     ap = argparse.ArgumentParser(description="Run a modular strategy backtest on OHLCV data.")
     ap.add_argument("--market_data", required=True, help="Path to CSV/Parquet with OHLCV data")
-    ap.add_argument("--outdir", default="../out", help="Output directory")
+    ap.add_argument("--outdir", default="out", help="Output directory")
     ap.add_argument("--commission_bps", type=float, default=1.0, help="Per-side commission in bps")
     ap.add_argument("--slippage_bps", type=float, default=1.0, help="Per-side slippage in bps")
-    ap.add_argument("--strategy_type", default=StrategyType.STAT, help="Strategy type")
-    ap.add_argument("--strategy_model", default=StatisticsModel.MULTI_FACTOR, help="Strategy model")
-    args = ap.parse_args()
+    ap.add_argument("--strategy_type", type=StrategyType, choices=list(StrategyType),
+                    default=StrategyType.STAT, help="Strategy type")
+    ap.add_argument("--strategy_model", help="Model enum value (default: MULTI_FACTOR or RIDGE_LINEAR)")
+    ap.add_argument("--trade_on", type=ExecutionType, choices=list(ExecutionType),
+                    default=ExecutionType.NEXT_OPEN, help="Execution timing")
+    ap.add_argument("--override_cache", action="store_true", help="Rebuild the cleaned CSV cache")
+    args = ap.parse_args(argv)
 
     # Choose strategy implementation
     if args.strategy_type == StrategyType.STAT:
-        if args.strategy_model == StatisticsModel.MULTI_FACTOR:
-            strat = MultiFactorStrategy()
-        elif args.strategy_model == StatisticsModel.MA:
-            strat = MAStrategy()
-        elif args.strategy_model == StatisticsModel.RSI:
-            strat = RSIStrategy()
-        else:
-            raise ValueError("Unknown statistics model")
-    elif args.strategy_type == StrategyType.ML:
-        strat = MLStrategy(model=args.strategy_model)
+        factories = {
+            StatisticsModel.MULTI_FACTOR: MultiFactorStrategy,
+            StatisticsModel.MA: MAStrategy,
+            StatisticsModel.RSI: RSIStrategy,
+        }
+        try:
+            model = StatisticsModel(args.strategy_model or StatisticsModel.MULTI_FACTOR)
+        except ValueError:
+            ap.error(f"statistics model must be one of: {', '.join(StatisticsModel)}")
+        strat = factories[model]()
     else:
-        raise ValueError("Unknown strategy type")
+        try:
+            model = MachineLearningModel(args.strategy_model or MachineLearningModel.RIDGE)
+        except ValueError:
+            ap.error(f"ML model must be one of: {', '.join(MachineLearningModel)}")
+        strat = MLStrategy(model=model)
 
-    ds = DataStore(override_cache=False)
+    ds = DataStore(override_cache=args.override_cache)
     market_data = ds.read(args.market_data)
+    if market_data.empty:
+        ap.error("market data contains no valid bars")
 
     engine = BackTestingEngine(
         market_data=market_data,
         commission_bps=args.commission_bps,
         slippage_bps=args.slippage_bps,
-        trade_on=ExecutionType.NEXT_OPEN,
+        trade_on=args.trade_on,
     )
 
     print(f"{now_str()} Backtesting Started...")
@@ -93,8 +114,13 @@ def main():
 
     # Persist artifacts
     os.makedirs(args.outdir, exist_ok=True)
-    with open(os.path.join(args.outdir, "summary.json"), "w") as f:
-        json.dump(out["summary"], f, indent=2)
+    # Undefined statistics are JSON null, not non-standard NaN tokens.
+    summary = {
+        key: value if math.isfinite(value) else None
+        for key, value in out["summary"].items()
+    }
+    with open(os.path.join(args.outdir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, allow_nan=False)
 
     # Save results
     out["results"].to_parquet(os.path.join(args.outdir, "results.parquet"))
@@ -103,7 +129,7 @@ def main():
     plot_equity(out["results"], os.path.join(args.outdir, "equity.png"))
     plot_drawdown(out["results"], os.path.join(args.outdir, "drawdown.png"))
 
-    print(f"{now_str()} Backtesting Completed.\nResults: \n{json.dumps(out["summary"], indent=2)}")
+    print(f"{now_str()} Backtesting Completed.\nResults: \n{json.dumps(summary, indent=2)}")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 [project]
 name = "backtesting"
 version = "0.1.0"
-description = "Add your description here"
+description = "Modular single-asset backtesting with causal signals and walk-forward ML"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -9,6 +9,20 @@ dependencies = [
     "numpy>=2.3.2",
     "pandas>=2.3.1",
     "pyarrow>=21.0.0",
-    "pytest>=8.4.1",
-    "torch>=2.7.1",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP"]
